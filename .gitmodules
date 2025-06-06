@@ -1,0 +1,6 @@
+[submodule "frontend"]
+	path = frontend
+	url = https://github.com/Jodee-Arat/Messenger-web-frontend
+[submodule "backend"]
+	path = backend
+	url = https://github.com/Jodee-Arat/Messenger-backend
