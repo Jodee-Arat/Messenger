@@ -1,0 +1,160 @@
+# MesArat Project Technical Analysis & Roadmap
+
+## Goal Description
+This document provides a deep technical analysis of the MesArat project, a secure messenger featuring a mobile app, web app, backend, and GOST-based end-to-end encryption (E2EE). The analysis uncovers architectural flows, assesses the cryptographic implementation, identifies critical risks and technical debt, and provides a structured roadmap for remediation.
+
+---
+
+## 1. Project Summary & Structure
+The project is structured as a monorepo containing three main components:
+- **`apps/mobile/`**: React Native (Expo) mobile client.
+- **`apps/web/`**: Next.js (App Router) web client.
+- **`backend/`**: NestJS backend.
+
+**Key Directories:**
+- `backend/prisma/schema.prisma`: Defines the PostgreSQL database schema (Users, Chats, Messages, PreKeys, Secret Queues).
+- `backend/src/`: Contains NestJS modules (`auth`, `chat`, `secret`, `group`, etc.).
+- `apps/mobile/app/libs/e2ee/`: Contains the core GOST cryptographic logic (`gost.ts`) and C++ engine bindings.
+- `apps/web/src/`: Contains Next.js pages, components, and GraphQL configurations.
+
+> [!NOTE]
+> The project successfully establishes a solid modern foundation (NestJS + GraphQL + Expo + Next.js), but it suffers from severe feature divergence between Web and Mobile, particularly concerning security.
+
+---
+
+## 2. Overall Architecture
+The system uses a classical Client-Server topology with real-time capabilities facilitated by GraphQL Subscriptions (WebSockets).
+
+**Flow Summary:**
+* **Mobile -> Backend**: Communicates via GraphQL HTTP (queries/mutations) and WebSockets (subscriptions). Uses `gost-crypto` for E2EE.
+* **Web -> Backend**: Communicates via GraphQL HTTP and WebSockets but **lacks E2EE**.
+* **Backend -> Infrastructure**: 
+  * **PostgreSQL** (via Prisma) for persistent storage.
+  * **Redis** for session management and ephemeral PreKey tracking.
+  * **AWS S3** (Selectel) for file/attachment storage.
+
+**E2EE Responsibility Split:**
+- **Client**: Generates keys, performs DH exchanges, derives session keys, encrypts/decrypts payloads locally.
+- **Server**: Acts as an untrusted router. It stores public PreKeys, routes `QueueSharedSecretKey` (encrypted session keys), and holds `QueueSecretMessage` (ciphertexts) until recipients fetch them, after which they are deleted.
+
+---
+
+## 3. E2EE / GOST Cryptography Analysis
+The mobile client implements the Extended Triple Diffie-Hellman (X3DH) protocol tailored for GOST algorithms.
+
+**Cryptographic Stack:**
+- **Key Exchange (DH)**: GOST R 34.10-2012 (Curve S-256-A).
+- **KDF**: GOST R 34.11-2012 (Streebog) via HMAC.
+- **Symmetric Encryption**: GOST R 34.12-2015 (Kuznechik) in CTR mode (128-bit block).
+- **Signatures**: GOST R 34.10-2012.
+
+**Keys Used:**
+- **Identity Key (IK)**: Long-term signing key.
+- **Signed PreKey (SPK)**: Ephemeral key signed by IK, rotated periodically.
+- **One-Time PreKey (OPK)**: Single-use keys to prevent replay attacks.
+- **Session Key**: Derived from DH1-DH4 using KDF.
+
+**Message Flow:**
+1. **Key Generation**: Alice and Bob generate IKs, SPKs, and OPKs. Public parts are sent to the server.
+2. **Session Setup (X3DH)**: Alice fetches Bob's PreKeys from the server. She computes DH1=IKa×SPKb, DH2=EKa×IKb, DH3=EKa×SPKb, DH4=EKa×OPKb. 
+3. **Derivation**: `KDF_Streebog(DH1||DH2||DH3||DH4)` produces the `sessionKey`.
+4. **Encryption**: `sessionKey` is used to derive an `encKey`. The message is encrypted using **Kuznechik CTR**.
+5. **Envelope**: Alice creates an `InitEnvelope` containing her public keys, IV, Ciphertext, and a Signature covering the AAD+IV+Ciphertext.
+6. **Transport**: The envelope is sent to the backend `queue_secret_messages`.
+7. **Decryption**: Bob receives the envelope, uses Alice's public keys and his private keys to reconstruct DH1-DH4 intuitively, deduces the `sessionKey`, verifies Alice's signature, and decrypts the ciphertext.
+
+### 🚨 Critical Cryptographic Flaw: Unauthenticated Encryption
+> [!CAUTION]
+> The Kuznechik symmetric encryption is implemented in `CTR` mode **without a Message Authentication Code (MAC)**. 
+> While the envelope signature authenticates the *sender*, standard Session Messages (`SessionMsgEnvelope`) rely only on CTR mode. CTR is malleable; an attacker who knows part of the plaintext can flip bits in the ciphertext, predictably altering the decrypted plaintext without invalidating the decryption process.
+
+---
+
+## 4. Mobile App Assessment
+- **Stack**: Expo, React Native, Apollo Client, Zustand (State), Nativewind (Tailwind).
+- **E2EE**: Fully implemented via `gost.ts` and `gostEngineRN`. Secret chats operate in parallel to standard chats. 
+- **Storage**: Keys, Chat Metadata, and Messages are saved strictly locally using `expo-file-system` (e.g., `messages.json`, `my-keys.json`).
+- **Weaknesses**: 
+  - The local storage mechanism (`expo-file-system`) writes raw JSON to disk. On a compromised or jailbroken device, these files are completely unprotected. They should be stored in `expo-secure-store`.
+  - The fallback RNG `Math.random()` in `fillRandom` is dangerously insecure if globals aren't polyfilled.
+
+---
+
+## 5. Web App Assessment
+- **Stack**: Next.js 15, React 19, Apollo Client, Zustand, TailwindCSS, Radix UI.
+- **Comparison to Mobile**: 
+  - Uses `crypto-js` instead of `gost-crypto`.
+  - **E2EE completely missing**. A search for Secret Chat components and GraphQL operations (`GetSharedSecretKey`, `SendSecretMessage`) yielded zero results. 
+- **Risk**: A user logging into the web app cannot participate in secret chats, breaking platform consistency and potentially confusing users who expect end-to-end security everywhere.
+
+---
+
+## 6. Backend Assessment
+- **Stack**: NestJS, Prisma, PostgreSQL, GraphQL + subscriptions, Redis.
+- **E2EE Awareness**: The server correctly acts "blind". It only knows routing metadata (sender, receiver, chat ID) and public keys/ciphertexts (`QueueSecretMessage`, `QueueSharedSecretKey`).
+- **Data Pruning**: Sockets push the message to users. Once `addSecretMessage` resolves, `updateSecretMessageForReader` is called. If all intended recipients fetch the message, it is deleted from the DB. 
+- **Weaknesses**: 
+  - Error handling in `updateSecretMessageForReader` uses `set` arrays sequentially, which could cause race conditions under high load.
+  - Sockets rely on Redis but session validation across scaling nodes could drop real-time events.
+
+---
+
+## 7. Problems and Risks
+
+| Area | Issue | Severity | Why it matters | Fix |
+|---|---|---|---|---|
+| **Cryptography** | Lack of MAC in CTR mode | **CRITICAL** | Ciphertexts are malleable. MITM can alter message contents seamlessly. | Implement Encrypt-then-MAC (e.g., HMAC-Streebog) for all `encryptKuz` outputs. |
+| **Parity** | Missing E2EE on Web | **HIGH** | Web users cannot use the core secure feature. Breaches user trust. | Port `gost.ts` and secret chat logic to Next.js using WebCrypto polyfills. |
+| **Mobile Storage** | Plaintext local JSON storage | **HIGH** | `expo-file-system` leaves deciphered E2EE messages exposed to other apps on compromised devices. | Use `expo-secure-store` to encrypt the local JSON database or migrate to SQLite with SQLCipher. |
+| **Cryptography** | `Math.random()` fallback in `gost.ts` | **HIGH** | Predictable IVs and keys if standard crypto APIs fail to load. | Throw a hard error if secure PRNG is unavailable. Never fallback to `Math.random()`. |
+| **Architecture** | Race conditions in Backend Message Deletion | **MEDIUM** | Messages might not be deleted immediately or could be deleted prematurely on parallel reads. | Use atomic Prisma updates or database-level transactions. |
+
+---
+
+## 8. Improvement Plan & Roadmap
+
+### Phase 1: Quick Fixes (High Priority Security)
+1. **Remove `Math.random()` Fallback:**
+   - *Goal*: Ensure secure PRNG is always used.
+   - *Files*: `mobile/app/libs/e2ee/gost.ts`.
+   - *Action*: Replace `Math.random()` with `throw new Error("Secure PRNG not available")`.
+2. **Fix Unauthenticated Encryption (Add MAC):**
+   - *Goal*: Prevent ciphertext malleability.
+   - *Files*: `mobile/app/libs/e2ee/gost.ts`.
+   - *Action*: Add `HMAC-Streebog` over the IV + Ciphertext during `encryptKuz`. Verify MAC in `decryptKuz`.
+
+### Phase 2: Medium Tasks (Storage & Reliability)
+3. **Secure Mobile Local Storage:**
+   - *Goal*: Protect decrypted messages at rest.
+   - *Files*: `mobile/app/utils/secret-chat/secretChat.ts`.
+   - *Action*: Encrypt the `messages.json` file using an AES key stored in React Native's SecureStore (via `expo-secure-store` / `expo-crypto`).
+4. **Backend Concurrency Fixes:**
+   - *Goal*: Prevent race conditions in message queues.
+   - *Files*: `backend/src/modules/secret/secret.service.ts`.
+   - *Action*: Refactor `updateSecretMessageForReader` to use Prisma `$transaction`.
+
+### Phase 3: Major Architectural Tasks
+5. **Implement E2EE in Web App:**
+   - *Goal*: Feature parity across platforms.
+   - *Affected*: `apps/web/src/`.
+   - *Action*: Port `gost.ts` logic to Next.js. Implement Web Workers for heavy cryptographic operations (X3DH, KDF) to avoid blocking the main thread. Wire up `SecretChat` UI components.
+
+---
+
+## Summary
+### Main Project Strengths:
+- Solid tech stack utilizing modern tooling (NestJS, GraphQL Subscriptions, Prisma, React Native).
+- The E2EE architecture (X3DH) is structurally sound regarding key exchange methodology.
+- The backend correctly enforces an "untrusted server" model, storing no plaintext data for secret chats.
+
+### Main Project Weaknesses:
+- The execution of symmetric encryption is flawed (unauthenticated CTR mode).
+- Stark feature divergence: Web client completely misses the platform's main selling point (Security/E2EE).
+- Mobile local storage nullifies the benefits of E2EE by storing decoded files unprotected on the filesystem.
+
+### Top 5 Highest-Priority Tasks:
+1. Implement Encrypt-then-MAC (HMAC-Streebog) for Kuznechik CTR encryption.
+2. Remove `Math.random()` fallback in the crypto module.
+3. Secure mobile local storage using `expo-secure-store`.
+4. Port the E2EE Secret Chat infrastructure to the Web application.
+5. Fix backend race conditions in the `queue_secret_message` deletion logic.
